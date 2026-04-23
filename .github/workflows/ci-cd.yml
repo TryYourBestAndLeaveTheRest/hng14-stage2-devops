@@ -1,0 +1,236 @@
+name: ci-cd
+
+on:
+  pull_request:
+    branches: ["**"]
+  push:
+    branches: ["**"]
+
+env:
+  REGISTRY: localhost:5000
+
+jobs:
+  lint:
+    name: lint
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+
+      - name: Install Python lint dependencies
+        run: pip install flake8
+
+      - name: Lint Python
+        run: flake8 api worker
+
+      - name: Install frontend dependencies
+        working-directory: frontend
+        run: npm install
+
+      - name: Lint JavaScript
+        working-directory: frontend
+        run: npm run lint
+
+      - name: Lint Dockerfiles with hadolint
+        run: |
+          docker run --rm -i hadolint/hadolint < api/Dockerfile
+          docker run --rm -i hadolint/hadolint < worker/Dockerfile
+          docker run --rm -i hadolint/hadolint < frontend/Dockerfile
+
+  test:
+    name: test
+    runs-on: ubuntu-latest
+    needs: [lint]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install test dependencies
+        run: pip install -r api/requirements.txt -r api/requirements-dev.txt
+
+      - name: Run API unit tests with coverage
+        run: pytest api/tests --cov=api --cov-report=xml --cov-report=term-missing
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: api-coverage
+          path: coverage.xml
+
+  build:
+    name: build
+    runs-on: ubuntu-latest
+    needs: [test]
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build images
+        run: |
+          docker build -f api/Dockerfile -t ${REGISTRY}/api:${GITHUB_SHA} -t ${REGISTRY}/api:latest .
+          docker build -f worker/Dockerfile -t ${REGISTRY}/worker:${GITHUB_SHA} -t ${REGISTRY}/worker:latest .
+          docker build -f frontend/Dockerfile -t ${REGISTRY}/frontend:${GITHUB_SHA} -t ${REGISTRY}/frontend:latest .
+
+      - name: Push images to local registry
+        run: |
+          docker push ${REGISTRY}/api:${GITHUB_SHA}
+          docker push ${REGISTRY}/api:latest
+          docker push ${REGISTRY}/worker:${GITHUB_SHA}
+          docker push ${REGISTRY}/worker:latest
+          docker push ${REGISTRY}/frontend:${GITHUB_SHA}
+          docker push ${REGISTRY}/frontend:latest
+
+      - name: Export images for next stages
+        run: |
+          docker save ${REGISTRY}/api:${GITHUB_SHA} -o api-image.tar
+          docker save ${REGISTRY}/worker:${GITHUB_SHA} -o worker-image.tar
+          docker save ${REGISTRY}/frontend:${GITHUB_SHA} -o frontend-image.tar
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: built-images
+          path: |
+            api-image.tar
+            worker-image.tar
+            frontend-image.tar
+
+  security-scan:
+    name: security scan
+    runs-on: ubuntu-latest
+    needs: [build]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Download image artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: built-images
+
+      - name: Load images
+        run: |
+          docker load -i api-image.tar
+          docker load -i worker-image.tar
+          docker load -i frontend-image.tar
+
+      - name: Setup Trivy
+        uses: aquasecurity/setup-trivy@v0.2.2
+
+      - name: Scan API image
+        run: trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-api.sarif ${REGISTRY}/api:${GITHUB_SHA}
+
+      - name: Scan worker image
+        run: trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-worker.sarif ${REGISTRY}/worker:${GITHUB_SHA}
+
+      - name: Scan frontend image
+        run: trivy image --exit-code 1 --severity CRITICAL --format sarif --output trivy-frontend.sarif ${REGISTRY}/frontend:${GITHUB_SHA}
+
+      - name: Upload SARIF artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: trivy-sarif
+          path: |
+            trivy-api.sarif
+            trivy-worker.sarif
+            trivy-frontend.sarif
+
+  integration-test:
+    name: integration test
+    runs-on: ubuntu-latest
+    needs: [security-scan]
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create environment file
+        run: cp .env.example .env
+
+      - name: Start full stack
+        run: docker compose up -d --build
+
+      - name: Submit and poll job through frontend
+        run: |
+          JOB_ID=$(curl -s -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit" | jq -r '.job_id')
+          if [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]]; then
+            echo "Failed to create job"
+            exit 1
+          fi
+
+          STATUS="queued"
+          for _ in $(seq 1 30); do
+            STATUS=$(curl -s "http://127.0.0.1:${FRONTEND_PORT:-3000}/status/${JOB_ID}" | jq -r '.status')
+            if [[ "${STATUS}" == "completed" ]]; then
+              break
+            fi
+            sleep 2
+          done
+
+          test "${STATUS}" = "completed"
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v --remove-orphans
+
+  deploy:
+    name: deploy
+    runs-on: ubuntu-latest
+    needs: [integration-test]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Create environment file
+        run: cp .env.example .env
+
+      - name: Start baseline stack
+        run: docker compose up -d --build redis api
+
+      - name: Build and push new API image
+        run: |
+          docker build -f api/Dockerfile -t ${REGISTRY}/api:${GITHUB_SHA} -t ${REGISTRY}/api:latest .
+          docker push ${REGISTRY}/api:${GITHUB_SHA}
+          docker push ${REGISTRY}/api:latest
+
+      - name: Run rolling update
+        env:
+          IMAGE_BASE: ${REGISTRY}/api
+          NEW_IMAGE_TAG: ${{ github.sha }}
+          OLD_IMAGE_TAG: latest
+          REDIS_HOST: redis
+          REDIS_PORT: "6379"
+          REDIS_DB: "0"
+          REDIS_PASSWORD: CHANGE_ME
+          NETWORK_NAME: jobapp_internal
+          TIMEOUT_SECONDS: "60"
+        run: bash scripts/rolling_update.sh
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose down -v --remove-orphans
