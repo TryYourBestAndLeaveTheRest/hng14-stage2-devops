@@ -1,14 +1,14 @@
-FROM node:22-alpine AS deps
+FROM node:22-alpine AS builder
 WORKDIR /app
 COPY frontend/package*.json ./
 RUN npm ci --omit=dev
 
-FROM node:22-alpine
+FROM node:22-alpine AS runner
 WORKDIR /app
 
 RUN addgroup -S app && adduser -S app -G app
 
-COPY --from=deps /app/node_modules /app/node_modules
+COPY --from=builder /app/node_modules /app/node_modules
 COPY frontend/app.js /app/app.js
 COPY frontend/views /app/views
 

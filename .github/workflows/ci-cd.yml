@@ -37,7 +37,7 @@ jobs:
         working-directory: frontend
         run: npm install
 
-      - name: Lint JavaScript
+      - name: Lint with ESLint
         working-directory: frontend
         run: npm run lint
 
@@ -64,7 +64,7 @@ jobs:
         run: pip install -r api/requirements.txt -r api/requirements-dev.txt
 
       - name: Run API unit tests with coverage
-        run: python -m pytest api/tests --cov=api --cov-report=xml --cov-report=term-missing
+        run: python -m pytest tests --cov=api --cov-report=xml --cov-report=term-missing
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v4
@@ -85,23 +85,50 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Build images
-        run: |
-          docker build -f api/Dockerfile -t ${REGISTRY}/api:${GITHUB_SHA} -t ${REGISTRY}/api:latest .
-          docker build -f worker/Dockerfile -t ${REGISTRY}/worker:${GITHUB_SHA} -t ${REGISTRY}/worker:latest .
-          docker build -f frontend/Dockerfile -t ${REGISTRY}/frontend:${GITHUB_SHA} -t ${REGISTRY}/frontend:latest .
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
 
-      - name: Push images to local registry
-        run: |
-          docker push ${REGISTRY}/api:${GITHUB_SHA}
-          docker push ${REGISTRY}/api:latest
-          docker push ${REGISTRY}/worker:${GITHUB_SHA}
-          docker push ${REGISTRY}/worker:latest
-          docker push ${REGISTRY}/frontend:${GITHUB_SHA}
-          docker push ${REGISTRY}/frontend:latest
+      - name: Build and push API
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: api/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/api:${{ github.sha }}
+            ${{ env.REGISTRY }}/api:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Worker
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: worker/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/worker:${{ github.sha }}
+            ${{ env.REGISTRY }}/worker:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Build and push Frontend
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: frontend/Dockerfile
+          push: true
+          tags: |
+            ${{ env.REGISTRY }}/frontend:${{ github.sha }}
+            ${{ env.REGISTRY }}/frontend:latest
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
 
       - name: Export images for next stages
         run: |
+          docker pull ${REGISTRY}/api:${GITHUB_SHA}
+          docker pull ${REGISTRY}/worker:${GITHUB_SHA}
+          docker pull ${REGISTRY}/frontend:${GITHUB_SHA}
           docker save ${REGISTRY}/api:${GITHUB_SHA} -o api-image.tar
           docker save ${REGISTRY}/worker:${GITHUB_SHA} -o worker-image.tar
           docker save ${REGISTRY}/frontend:${GITHUB_SHA} -o frontend-image.tar
@@ -170,47 +197,8 @@ jobs:
         run: docker compose up -d --build
 
       # - name: Submit and poll job through frontend
-      - name: Submit and poll job through frontend
-        run: |
-          set -e
-
-          # Wait for service
-          echo "Waiting for frontend..."
-          until curl -sf http://127.0.0.1:${FRONTEND_PORT:-3000}/health; do
-            sleep 2
-          done
-
-          echo "Submitting job..."
-          RESPONSE=$(curl -sf -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit")
-          echo "Submit response: $RESPONSE"
-
-          JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id')
-
-          if [[ -z "$JOB_ID" || "$JOB_ID" == "null" ]]; then
-            echo "Failed to create job"
-            exit 1
-          fi
-
-          echo "Polling job: $JOB_ID"
-
-          STATUS="queued"
-          for _ in $(seq 1 30); do
-            RESPONSE=$(curl -sf "http://127.0.0.1:${FRONTEND_PORT:-3000}/status/${JOB_ID}")
-            echo "Status response: $RESPONSE"
-
-            STATUS=$(echo "$RESPONSE" | jq -r '.status')
-
-            if [[ "$STATUS" == "completed" ]]; then
-              break
-            fi
-
-            sleep 2
-          done
-
-          if [[ "$STATUS" != "completed" ]]; then
-            echo "Job did not complete. Final status: $STATUS"
-            exit 1
-          fi
+      - name: Run integration tests
+        run: bash scripts/integration.sh
         # run: |
         #   JOB_ID=$(curl -s -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit" | jq -r '.job_id')
         #   if [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]]; then
@@ -267,7 +255,7 @@ jobs:
           REDIS_HOST: redis
           REDIS_PORT: "6379"
           REDIS_DB: "0"
-          REDIS_PASSWORD: CHANGE_ME
+          REDIS_PASSWORD: ${{ secrets.REDIS_PASSWORD }}
           NETWORK_NAME: jobapp_internal
           TIMEOUT_SECONDS: "60"
         run: bash scripts/rolling_update.sh

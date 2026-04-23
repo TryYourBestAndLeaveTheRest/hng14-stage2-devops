@@ -1,14 +1,16 @@
+FROM python:3.12-slim AS builder
+WORKDIR /app
+COPY api/requirements.txt .
+RUN pip install --no-cache-dir --prefix=/install -r requirements.txt
+
 FROM python:3.12-slim
+WORKDIR /app
+COPY --from=builder /install /usr/local
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1
 
-WORKDIR /app
-
 RUN addgroup --system app && adduser --system --ingroup app app
-
-COPY api/requirements.txt /app/requirements.txt
-RUN pip install --no-cache-dir -r /app/requirements.txt
 
 COPY api/main.py /app/main.py
 
