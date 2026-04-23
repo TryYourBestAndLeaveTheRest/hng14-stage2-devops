@@ -169,24 +169,65 @@ jobs:
       - name: Start full stack
         run: docker compose up -d --build
 
+      # - name: Submit and poll job through frontend
       - name: Submit and poll job through frontend
         run: |
-          JOB_ID=$(curl -s -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit" | jq -r '.job_id')
-          if [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]]; then
+          set -e
+
+          # Wait for service
+          echo "Waiting for frontend..."
+          until curl -sf http://127.0.0.1:${FRONTEND_PORT:-3000}/health; do
+            sleep 2
+          done
+
+          echo "Submitting job..."
+          RESPONSE=$(curl -sf -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit")
+          echo "Submit response: $RESPONSE"
+
+          JOB_ID=$(echo "$RESPONSE" | jq -r '.job_id')
+
+          if [[ -z "$JOB_ID" || "$JOB_ID" == "null" ]]; then
             echo "Failed to create job"
             exit 1
           fi
 
+          echo "Polling job: $JOB_ID"
+
           STATUS="queued"
           for _ in $(seq 1 30); do
-            STATUS=$(curl -s "http://127.0.0.1:${FRONTEND_PORT:-3000}/status/${JOB_ID}" | jq -r '.status')
-            if [[ "${STATUS}" == "completed" ]]; then
+            RESPONSE=$(curl -sf "http://127.0.0.1:${FRONTEND_PORT:-3000}/status/${JOB_ID}")
+            echo "Status response: $RESPONSE"
+
+            STATUS=$(echo "$RESPONSE" | jq -r '.status')
+
+            if [[ "$STATUS" == "completed" ]]; then
               break
             fi
+
             sleep 2
           done
 
-          test "${STATUS}" = "completed"
+          if [[ "$STATUS" != "completed" ]]; then
+            echo "Job did not complete. Final status: $STATUS"
+            exit 1
+          fi
+        # run: |
+        #   JOB_ID=$(curl -s -X POST "http://127.0.0.1:${FRONTEND_PORT:-3000}/submit" | jq -r '.job_id')
+        #   if [[ -z "${JOB_ID}" || "${JOB_ID}" == "null" ]]; then
+        #     echo "Failed to create job"
+        #     exit 1
+        #   fi
+
+        #   STATUS="queued"
+        #   for _ in $(seq 1 30); do
+        #     STATUS=$(curl -s "http://127.0.0.1:${FRONTEND_PORT:-3000}/status/${JOB_ID}" | jq -r '.status')
+        #     if [[ "${STATUS}" == "completed" ]]; then
+        #       break
+        #     fi
+        #     sleep 2
+        #   done
+
+        #   test "${STATUS}" = "completed"
 
       - name: Tear down stack
         if: always()
